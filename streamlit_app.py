@@ -1,133 +1,130 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+import numpy as np
+from datetime import datetime
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="Athlete Performance Lab", layout="wide")
+# --- SETTINGS ---
+st.set_page_config(page_title="Fast RBI Athlete Pro Dashboard", layout="wide")
 
-st.title("⚾ Athlete Data Assistant")
-
-# --- DATA STORAGE ---
-# This keeps the data active while you are using the app
+# --- INITIALIZE DATABASE ---
 if 'master_df' not in st.session_state:
     st.session_state.master_df = pd.DataFrame()
+if 'checkins' not in st.session_state:
+    # This stores every single time a kid puts their weight in
+    st.session_state.checkins = pd.DataFrame(columns=['Athlete', 'Date', 'Weight', 'Height'])
 
-# --- SIDEBAR ---
-st.sidebar.header("Navigation")
-page = st.sidebar.radio("Go to:", ["Upload Data", "Athlete Profiles", "Leaderboard"])
+# --- HELPER: LINKING & ANALYTICS ---
+def link_swings(blast_df, fs_df):
+    if blast_df.empty or fs_df.empty: return pd.DataFrame()
+    blast_df.columns = [c.strip() for c in blast_df.columns]
+    fs_df.columns = [c.strip() for c in fs_df.columns]
+    # Standardize Timestamps
+    blast_df['Timestamp'] = pd.to_datetime(blast_df['Date'])
+    fs_df['Timestamp'] = pd.to_datetime(fs_df['Date'] + ' ' + fs_df['Time'])
+    blast_df = blast_df.sort_values('Timestamp')
+    fs_df = fs_df.sort_values('Timestamp')
+    # Fuzzy Match within 6 seconds
+    return pd.merge_asof(fs_df, blast_df[['Timestamp', 'Bat Speed (mph)', 'Rotational Acceleration (g)', 'Attack Angle (deg)', 'Vertical Bat Angle (deg)']], 
+                         on='Timestamp', direction='nearest', tolerance=pd.Timedelta('6s'))
 
-# --- HELPER FUNCTION: Clean Blast Data ---
-def load_blast(file):
-    # Blast has 8 lines of header info before the actual data starts
-    df = pd.read_csv(file, skiprows=8)
-    df.columns = [c.strip() for c in df.columns]
-    # Clean up the Date
-    df['Date_Clean'] = pd.to_datetime(df['Date']).dt.date
-    # Blast doesn't always have a 'Name' column in individual exports
-    # We will add a placeholder if it's missing
-    if 'Athlete' not in df.columns:
-        df['Athlete'] = "Unknown Athlete"
-    return df
+def get_1_8th_metrics(df):
+    """Anchor = ExitSpeed. Find stats for the top 12.5% hardest hits."""
+    df['ExitSpeed'] = pd.to_numeric(df['ExitSpeed'], errors='coerce')
+    hits = df[df['ExitSpeed'] > 0].dropna(subset=['ExitSpeed'])
+    if hits.empty: return {k: 0 for k in ["BS_18", "RA_18", "EV_18", "SF_18", "HLA_18", "LA_18"]}
+    hits = hits.sort_values('ExitSpeed', ascending=False)
+    num_top = max(1, int(len(hits) * 0.125))
+    top_8th = hits.head(num_top)
+    bs_col = 'Bat Speed (mph)' if 'Bat Speed (mph)' in top_8th.columns else 'BatSpeed'
+    return {
+        "BS_18": top_8th[bs_col].mean(), "RA_18": top_8th['Rotational Acceleration (g)'].mean() if 'Rotational Acceleration (g)' in top_8th.columns else 0,
+        "EV_18": top_8th['ExitSpeed'].mean(), "SF_18": top_8th['SmashFactor'].mean() if 'SmashFactor' in top_8th.columns else 0,
+        "HLA_18": top_8th['Direction'].mean() if 'Direction' in top_8th.columns else 0, "LA_18": top_8th['Angle'].mean() if 'Angle' in top_8th.columns else 0,
+        "Top_Hits": top_8th
+    }
 
-# --- HELPER FUNCTION: Clean Full Swing Data ---
-def load_fullswing(file):
-    df = pd.read_csv(file)
-    df.columns = [c.strip() for c in df.columns]
-    # Standardize 'Batter' to 'Athlete' so they match
-    if 'Batter' in df.columns:
-        df = df.rename(columns={'Batter': 'Athlete'})
-    df['Date_Clean'] = pd.to_datetime(df['Date']).dt.date
-    return df
+# --- UI: SIDEBAR ---
+st.sidebar.title("Fast RBI Control")
+athlete_name = st.sidebar.text_input("Enter Athlete Name", "Trenton Wheat")
 
-# --- PAGE 1: UPLOAD ---
-if page == "Upload Data":
-    st.header("Upload CSV Files")
-    
+st.sidebar.markdown("---")
+st.sidebar.subheader("📍 Session Check-In")
+with st.sidebar.form("daily_checkin"):
+    check_date = st.date_input("Date of Check-in", datetime.now())
+    w_input = st.number_input("Weight (lbs)", value=140.0, step=0.1)
+    h_input = st.number_input("Height (in)", value=66.0, step=0.1)
+    if st.form_submit_button("Submit Weight & Height"):
+        new_row = pd.DataFrame([{'Athlete': athlete_name, 'Date': pd.to_datetime(check_date), 'Weight': w_input, 'Height': h_input}])
+        st.session_state.checkins = pd.concat([st.session_state.checkins, new_row]).drop_duplicates()
+        st.sidebar.success(f"Logged for {check_date.strftime('%b %d')}!")
+
+# --- UI: TABS ---
+tab1, tab2, tab3 = st.tabs(["Dashboard", "Upload Files", "Physical History"])
+
+with tab2:
+    st.header("Upload Data")
     col1, col2 = st.columns(2)
+    with col1: b_file = st.file_uploader("Blast CSV", type="csv")
+    with col2: fs_file = st.file_uploader("Full Swing CSV", type="csv")
     
-    with col1:
-        blast_file = st.file_uploader("Upload Blast Motion (Monthly)", type="csv")
-        if blast_file:
-            try:
-                b_df = load_blast(blast_file)
-                st.success("Blast Data Loaded!")
-                if st.button("Save Blast Data"):
-                    b_df['Source'] = "Blast"
-                    st.session_state.master_df = pd.concat([st.session_state.master_df, b_df], ignore_index=True)
-            except:
-                st.error("Error reading Blast file. Make sure it's the original export.")
+    if st.button("Link & Save Data"):
+        if b_file and fs_file:
+            merged = link_swings(pd.read_csv(b_file, skiprows=8), pd.read_csv(fs_file))
+            merged['Athlete'] = athlete_name
+            st.session_state.master_df = pd.concat([st.session_state.master_df, merged]).drop_duplicates()
+            st.success("Data Linked!")
 
-    with col2:
-        fs_file = st.file_uploader("Upload Full Swing (Daily)", type="csv")
-        if fs_file:
-            try:
-                fs_df = load_fullswing(fs_file)
-                st.success("Full Swing Data Loaded!")
-                if st.button("Save Full Swing Data"):
-                    fs_df['Source'] = "FullSwing"
-                    st.session_state.master_df = pd.concat([st.session_state.master_df, fs_df], ignore_index=True)
-            except:
-                st.error("Error reading Full Swing file.")
+with tab3:
+    st.header("Physical Log History")
+    a_checkins = st.session_state.checkins[st.session_state.checkins['Athlete'] == athlete_name]
+    st.table(a_checkins.sort_values('Date', ascending=False))
+    # Option to download so you don't lose data
+    st.download_button("Download History as CSV", a_checkins.to_csv(index=False), f"{athlete_name}_physicals.csv")
 
-# --- PAGE 2: ATHLETE PROFILES ---
-elif page == "Athlete Profiles":
+with tab1:
     if st.session_state.master_df.empty:
-        st.warning("No data found. Please upload files first.")
+        st.warning("Upload data to see the Trenton Wheat Table.")
     else:
-        df = st.session_state.master_df
+        df = st.session_state.master_df[st.session_state.master_df['Athlete'] == athlete_name].copy()
+        df['MonthGroup'] = pd.to_datetime(df['Timestamp']).dt.strftime('%Y-%m') # Using YYYY-MM to keep months sorted
         
-        # Athlete Selection
-        athlete_list = df['Athlete'].unique()
-        selected_athlete = st.sidebar.selectbox("Select Athlete", athlete_list)
-        
-        athlete_df = df[df['Athlete'] == selected_athlete]
-        
-        st.header(f"Performance Profile: {selected_athlete}")
-        
-        # --- METRIC CARDS ---
-        c1, c2, c3, c4 = st.columns(4)
-        
-        # Calculate Averages based on what data is available
-        if 'Exit Velocity (mph)' in athlete_df.columns:
-            avg_exit = athlete_df['Exit Velocity (mph)'].mean()
-            c1.metric("Avg Exit Velocity", f"{avg_exit:.1f} mph")
+        # Get Physicals for the athlete
+        phys = st.session_state.checkins[st.session_state.checkins['Athlete'] == athlete_name].copy()
+        phys['MonthGroup'] = pd.to_datetime(phys['Date']).dt.strftime('%Y-%m')
+        # Average weight per month
+        monthly_phys = phys.groupby('MonthGroup').agg({'Weight': 'mean', 'Height': 'mean'}).reset_index()
+
+        monthly_report = []
+        for month in sorted(df['MonthGroup'].unique(), reverse=True):
+            m_df = df[df['MonthGroup'] == month]
+            t8 = get_1_8th_metrics(m_df)
+            top_hits = t8['Top_Hits']
             
-        if 'Bat Speed (mph)' in athlete_df.columns:
-            avg_bat = athlete_df['Bat Speed (mph)'].mean()
-            c2.metric("Avg Bat Speed", f"{avg_bat:.1f} mph")
+            # Physicals for THIS month ONLY
+            p_match = monthly_phys[monthly_phys['MonthGroup'] == month]
+            m_weight = p_match['Weight'].values[0] if not p_match.empty else 0
+            m_height = p_match['Height'].values[0] if not p_match.empty else 0
+            
+            # Whiff Calc
+            bs_col = 'Bat Speed (mph)' if 'Bat Speed (mph)' in m_df.columns else 'BatSpeed'
+            swings = m_df[m_df[bs_col] > 0]
+            whiffs = swings[(swings['ExitSpeed'].isna()) | (swings['ExitSpeed'] == 0)]
+            whiff_pct = (len(whiffs) / len(swings) * 100) if len(swings) > 0 else 0
 
-        if 'SmashFactor' in athlete_df.columns:
-            avg_smash = pd.to_numeric(athlete_df['SmashFactor'], errors='coerce').mean()
-            c3.metric("Avg Smash Factor", f"{avg_smash:.2f}")
+            monthly_report.append({
+                "Date Range": datetime.strptime(month, '%Y-%m').strftime('%b %Y'),
+                "BS Avg": m_df[bs_col].mean(), "BS Max": m_df[bs_col].max(), "BS 1/8th": t8['BS_18'],
+                "RA Avg": m_df['Rotational Acceleration (g)'].mean() if 'Rotational Acceleration (g)' in m_df.columns else 0,
+                "RA 1/8th": t8['RA_18'], "AA Avg": m_df['Attack Angle (deg)'].mean() if 'Attack Angle (deg)' in m_df.columns else 0,
+                "EV Avg": m_df['ExitSpeed'].mean(), "EV Max": m_df['ExitSpeed'].max(), "EV 1/8th": t8['EV_18'],
+                "HLA Avg": t8['HLA_18'], "LA Avg": t8['LA_18'],
+                "Burn %": (len(top_hits[(top_hits['Angle'] >= -1) & (top_hits['Angle'] <= 9.9)]) / len(top_hits) * 100) if len(top_hits) > 0 else 0,
+                "Ropes %": (len(top_hits[(top_hits['Angle'] >= 10) & (top_hits['Angle'] <= 20)]) / len(top_hits) * 100) if len(top_hits) > 0 else 0,
+                "Bombs %": (len(top_hits[(top_hits['Angle'] >= 21) & (top_hits['Angle'] <= 31)]) / len(top_hits) * 100) if len(top_hits) > 0 else 0,
+                "SF": m_df['SmashFactor'].mean() if 'SmashFactor' in m_df.columns else 0,
+                "1/8th SF": t8['SF_18'], "Weight": m_weight, "Whiff %": f"{whiff_pct:.1f}%",
+                "mph/lbs": (m_df['ExitSpeed'].max() / m_weight) if m_weight > 0 else 0,
+                "lbs/in": (m_weight / m_height) if m_height > 0 else 0
+            })
 
-        if 'Rotational Acceleration (g)' in athlete_df.columns:
-            avg_rot = athlete_df['Rotational Acceleration (g)'].mean()
-            c4.metric("Avg Rotational Accel", f"{avg_rot:.1f} g")
-
-        # --- CHARTS ---
-        st.subheader("Progress Over Time")
-        # List all numeric columns for the user to pick a chart
-        numeric_cols = athlete_df.select_dtypes(include=['float64', 'int64']).columns
-        chart_metric = st.selectbox("Select Metric to View Trend:", numeric_cols)
-        
-        fig = px.line(athlete_df.sort_values('Date_Clean'), 
-                     x='Date_Clean', y=chart_metric, 
-                     markers=True, title=f"{chart_metric} Trend")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Raw Session Data")
-        st.dataframe(athlete_df)
-
-# --- PAGE 3: LEADERBOARD ---
-elif page == "Leaderboard":
-    if st.session_state.master_df.empty:
-        st.warning("No data found.")
-    else:
-        st.header("Team Leaderboard")
-        metric_choice = st.selectbox("Rank By:", ["Bat Speed (mph)", "Exit Velocity (mph)", "Rotational Acceleration (g)"])
-        
-        if metric_choice in st.session_state.master_df.columns:
-            leaderboard = st.session_state.master_df.groupby("Athlete")[metric_choice].max().sort_values(ascending=False)
-            st.table(leaderboard)
-        else:
-            st.info(f"Not enough data to rank by {metric_choice}")
+        st.dataframe(pd.DataFrame(monthly_report).style.format(precision=1), use_container_width=True)
