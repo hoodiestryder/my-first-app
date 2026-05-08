@@ -1,102 +1,114 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
 
-# 1. Setup the Page
-st.set_page_config(page_title="Fast RBI Athlete Assistant", layout="wide")
-st.title("⚾ Fast RBI Performance Dashboard")
+st.set_page_config(page_title="Fast RBI Athlete Dashboard", layout="wide")
+st.title("⚾ Fast RBI Data Assistant")
 
-# Initialize memory
-if 'master_data' not in st.session_state:
-    st.session_state.master_data = pd.DataFrame()
-
-# --- THE SMART LOADER (Fixes the ParserError) ---
-def smart_load(file):
-    try:
-        # Check first few lines to see if it's Blast or Full Swing
-        header_check = file.read(500).decode('utf-8', errors='ignore')
-        file.seek(0)
+# --- THE HEADER HUNTER (The Fix for your ParserError) ---
+def find_the_real_data(uploaded_file):
+    # Read the file as raw text first
+    raw_content = uploaded_file.read().decode('utf-8', errors='ignore')
+    lines = raw_content.splitlines()
+    
+    # We are looking for the row that contains "Date" and either "Equipment" or "PitchNo"
+    header_row_index = -1
+    file_type = "Unknown"
+    
+    for i, line in enumerate(lines):
+        # Clean up the line for checking
+        clean_line = line.replace('"', '').strip()
         
-        if "PitchNo" in header_check or "Batter" in header_check:
-            # FULL SWING LOGIC
-            df = pd.read_csv(file)
-            df.columns = [c.strip().replace('"', '') for c in df.columns]
-            if 'Batter' in df.columns:
-                df = df.rename(columns={'Batter': 'Athlete'})
-            # Link Date and Time
-            df['Timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
-            return df, "Full Swing"
+        # Check for Blast Motion Headers
+        if "Date" in clean_line and "Equipment" in clean_line:
+            header_row_index = i
+            file_type = "Blast"
+            break
+        # Check for Full Swing Headers
+        if "PitchNo" in clean_line and "Date" in clean_line:
+            header_row_index = i
+            file_type = "FullSwing"
+            break
             
-        else:
-            # BLAST MOTION LOGIC (The "Skip" Fix)
-            # We skip 8 lines to get past the Copyright/Email stuff
-            df = pd.read_csv(file, skiprows=8)
-            df.columns = [c.strip().replace('"', '') for c in df.columns]
-            
-            # Extract name from filename or top header if possible
-            # For now, let's look for Date to confirm it's a Blast file
-            if "Date" in df.columns:
-                df['Timestamp'] = pd.to_datetime(df['Date'], errors='coerce')
-                return df, "Blast Motion"
-                
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-    return None, None
+    if header_row_index == -1:
+        return None, None
+
+    # Now read the CSV starting from that specific row
+    uploaded_file.seek(0)
+    df = pd.read_csv(uploaded_file, skiprows=header_row_index)
+    
+    # Clean up column names
+    df.columns = [c.strip().replace('"', '') for c in df.columns]
+    
+    # Standardize Names
+    if file_type == "FullSwing" and "Batter" in df.columns:
+        df = df.rename(columns={"Batter": "Athlete"})
+    
+    return df, file_type
 
 # --- SIDEBAR ---
 st.sidebar.header("Athlete Settings")
-manual_name = st.sidebar.text_input("Assign Name to Blast Data:", "Leo Echevarria")
+manual_name = st.sidebar.text_input("Name for Blast Files:", "Leo Echevarria")
 
-# --- UPLOAD SECTION ---
+# --- UPLOAD ---
 st.header("1. Upload CSV Files")
 uploaded_files = st.file_uploader("Upload Blast or Full Swing CSVs", accept_multiple_files=True)
 
-if uploaded_files:
-    temp_dfs = []
-    for f in uploaded_files:
-        df, file_type = smart_load(f)
-        if df is not None:
-            # If Blast file, it often lacks a name column, so we add the sidebar name
-            if file_type == "Blast Motion" and 'Athlete' not in df.columns:
-                df['Athlete'] = manual_name
-            
-            temp_dfs.append(df)
-            st.success(f"Successfully Loaded {file_type}: {f.name}")
-    
-    if st.button("Generate Dashboard Table"):
-        if temp_dfs:
-            st.session_state.master_data = pd.concat(temp_dfs, ignore_index=True)
+all_data = []
 
-# --- DASHBOARD SECTION ---
-if not st.session_state.master_data.empty:
-    st.header("2. Performance Table")
-    master = st.session_state.master_data
+if uploaded_files:
+    for f in uploaded_files:
+        df, f_type = find_the_real_data(f)
+        
+        if df is not None:
+            # If Blast file has no name, use the sidebar name
+            if f_type == "Blast" and ("Athlete" not in df.columns or df["Athlete"].isnull().all()):
+                df["Athlete"] = manual_name
+            
+            # Create a uniform Timestamp
+            if f_type == "FullSwing":
+                df['Timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
+            else:
+                df['Timestamp'] = pd.to_datetime(df['Date'], errors='coerce')
+            
+            all_data.append(df)
+            st.success(f"✅ Successfully read {f_type} file: {f.name}")
+        else:
+            st.error(f"❌ Could not find the data table in {f.name}. Make sure 'Date' is in the header row.")
+
+# --- DASHBOARD ---
+if all_data:
+    st.divider()
+    master_df = pd.concat(all_data, ignore_index=True)
     
     # Filter by Athlete
-    athletes = master['Athlete'].unique()
-    selected = st.selectbox("Select Athlete Profile", athletes)
+    athlete_list = master_df['Athlete'].unique()
+    selected_athlete = st.selectbox("Select Athlete Profile", athlete_list)
     
-    a_df = master[master['Athlete'] == selected].copy()
-    a_df['ExitSpeed'] = pd.to_numeric(a_df['ExitSpeed'], errors='coerce')
-    a_df['Angle'] = pd.to_numeric(a_df['Angle'], errors='coerce')
+    athlete_df = master_df[master_df['Athlete'] == selected_athlete].copy()
     
-    # Identify the Top 12.5% of Exit Velo
-    hard_hits = a_df[a_df['ExitSpeed'] > 0].sort_values('ExitSpeed', ascending=False)
-    num_top = max(1, int(len(hard_hits) * 0.125))
-    top_8th = hard_hits.head(num_top)
+    # --- MATH ENGINE ---
+    st.header(f"📊 Dashboard: {selected_athlete}")
     
-    # Simple Trenton Wheat Style Summary
+    # Convert numbers
+    athlete_df['ExitSpeed'] = pd.to_numeric(athlete_df['ExitSpeed'], errors='coerce')
+    athlete_df['Angle'] = pd.to_numeric(athlete_df['Angle'], errors='coerce')
+    
+    # Find Top 12.5% (1/8th) of hits by Exit Velocity
+    hard_hits = athlete_df[athlete_df['ExitSpeed'] > 0].sort_values('ExitSpeed', ascending=False)
+    num_8th = max(1, int(len(hard_hits) * 0.125))
+    top_8th = hard_hits.head(num_8th)
+    
     if not top_8th.empty:
-        summary = {
-            "Athlete": selected,
-            "EV Max": a_df['ExitSpeed'].max(),
-            "EV 1/8th Avg": top_8th['ExitSpeed'].mean(),
-            "LA 1/8th Avg": top_8th['Angle'].mean(),
-            "Burners %": (len(top_8th[(top_8th['Angle'] >= -1) & (top_8th['Angle'] <= 9.9)]) / len(top_8th) * 100),
-            "Ropes %": (len(top_8th[(top_8th['Angle'] >= 10) & (top_8th['Angle'] <= 20)]) / len(top_8th) * 100),
-            "Bombs %": (len(top_8th[(top_8th['Angle'] >= 21) & (top_8th['Angle'] <= 31)]) / len(top_8th) * 100)
-        }
-        st.table(pd.DataFrame([summary]).style.format(precision=1))
-    
-    with st.expander("Show Raw Merged Data"):
-        st.dataframe(a_df)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Top EV Avg", f"{top_8th['ExitSpeed'].mean():.1f} mph")
+        col2.metric("Max EV", f"{athlete_df['ExitSpeed'].max():.1f} mph")
+        
+        # Hit Classification
+        burners = len(top_8th[(top_8th['Angle'] >= -1) & (top_8th['Angle'] <= 9.9)])
+        st.write(f"**Top 1/8th Breakdown:** {burners} Burners found in hard hits.")
+        
+        st.dataframe(top_8th[['Timestamp', 'ExitSpeed', 'Angle', 'Direction']])
+    else:
+        st.info("No hits with Exit Velocity found for this athlete.")
