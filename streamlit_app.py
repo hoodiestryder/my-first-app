@@ -1,129 +1,127 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
+from io import StringIO
 
-# --- SETUP ---
-st.set_page_config(page_title="Fast RBI Final Fix", layout="wide")
-st.title("⚾ Fast RBI Athlete Dashboard")
+st.set_page_config(page_title="Fast RBI - Stage 1", layout="wide")
+st.title("⚾ Fast RBI Performance Reset")
+st.info("Goal: Get the Trenton Wheat table to appear on screen. (Google Sheets is disabled for this test)")
 
-# --- DATA STORAGE (Temporary until Google Sheets is linked) ---
-if 'master_df' not in st.session_state:
-    st.session_state.master_df = pd.DataFrame()
-
-# --- THE "LASER" LOADERS ---
-
-def load_full_swing(file):
-    """Detects 'Batter' and converts to 'Player'"""
-    df = pd.read_csv(file)
-    df.columns = [c.strip().replace('"', '') for c in df.columns]
+# --- THE BULLETPROOF LOADER ---
+def smart_load(file):
+    # Read the whole file as text to find the start
+    content = file.read().decode('utf-8', errors='ignore')
+    lines = content.splitlines()
     
-    if 'Batter' in df.columns:
-        df = df.rename(columns={'Batter': 'Player'})
-        # Combine Date and Time
+    # 1. Look for Full Swing (has PitchNo)
+    if "PitchNo" in content:
+        file.seek(0)
+        df = pd.read_csv(file)
+        df.columns = [c.strip().replace('"', '') for c in df.columns]
+        if 'Batter' in df.columns:
+            df = df.rename(columns={'Batter': 'Athlete'})
         df['Timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
-        return df
-    return None
+        return df, "FullSwing"
 
-def load_blast(file):
-    """Extracts name from the Row 0 'Sentence' and reads data below."""
-    # 1. Grab the name from the very first line
-    # Format: "Metrics - Leo Echevarria - 2026-03-01..."
-    first_line = pd.read_csv(file, nrows=0).columns[0]
-    try:
-        athlete_name = first_line.split('-')[1].strip()
-    except:
-        athlete_name = "Unknown Athlete"
-    
-    # 2. Find the actual data table (scans for the word "Date")
-    file.seek(0)
-    lines = file.readlines()
-    data_start_row = 0
+    # 2. Look for Blast (find the row where "Date" starts)
+    data_start = -1
     for i, line in enumerate(lines):
-        if b"Date" in line and b"Equipment" in line:
-            data_start_row = i
+        if "Date" in line and "Equipment" in line:
+            data_start = i
             break
-            
-    file.seek(0)
-    df = pd.read_csv(file, skiprows=data_start_row)
-    df.columns = [c.strip().replace('"', '') for c in df.columns]
     
-    # 3. Add the name we found at the top to every row
-    df['Player'] = athlete_name
-    df['Timestamp'] = pd.to_datetime(df['Date'], errors='coerce')
-    return df
+    if data_start != -1:
+        file.seek(0)
+        df = pd.read_csv(file, skiprows=data_start)
+        df.columns = [c.strip().replace('"', '') for c in df.columns]
+        df['Timestamp'] = pd.to_datetime(df['Date'], errors='coerce')
+        # Try to find name in the very first line if possible
+        if "Metrics" in lines[0]:
+            try:
+                df['Athlete'] = lines[0].split('-')[1].strip()
+            except:
+                df['Athlete'] = "Unknown"
+        return df, "Blast"
 
-# --- UPLOAD SECTION ---
-st.header("1. Upload Files")
-files = st.file_uploader("Upload Blast & Full Swing CSVs", accept_multiple_files=True)
+    return None, None
+
+# --- SIDEBAR CONTROL ---
+st.sidebar.header("Manual Controls")
+manual_name = st.sidebar.text_input("If name is missing, use:", "Trenton Wheat")
+weight = st.sidebar.number_input("Weight (lbs)", value=140.0)
+
+# --- UPLOAD ---
+files = st.file_uploader("Upload CSVs", accept_multiple_files=True)
 
 if files:
-    processed_dfs = []
+    all_swings = []
+    
     for f in files:
-        # Check first line to see if it's Blast or Full Swing
-        f.seek(0)
-        first_bits = f.read(100).decode('utf-8', errors='ignore')
-        f.seek(0)
-        
-        if "PitchNo" in first_bits or "Batter" in first_bits:
-            df = load_full_swing(f)
-            if df is not None:
-                st.success(f"✅ Full Swing Loaded: {df['Player'].iloc[0]}")
-                processed_dfs.append(df)
-        elif "Blast Motion" in first_bits or "Metrics" in first_bits:
-            df = load_blast(f)
-            if df is not None:
-                st.success(f"✅ Blast Motion Loaded: {df['Player'].iloc[0]}")
-                processed_dfs.append(df)
+        df, f_type = smart_load(f)
+        if df is not None:
+            if 'Athlete' not in df.columns or df['Athlete'].iloc[0] == "Unknown":
+                df['Athlete'] = manual_name
+            all_swings.append(df)
+            st.success(f"Loaded {f_type}: {f.name}")
 
-    if st.button("Link Data & Build Dashboard"):
-        # Separate the two types
-        fs_only = [d for d in processed_dfs if 'PitchNo' in d.columns]
-        blast_only = [d for d in processed_dfs if 'Equipment' in d.columns]
+    if len(all_swings) >= 1:
+        # Combine all data
+        master = pd.concat(all_swings, ignore_index=True)
         
-        if fs_only and blast_only:
-            fs_master = pd.concat(fs_only).sort_values('Timestamp')
-            blast_master = pd.concat(blast_only).sort_values('Timestamp')
+        # FUZZY LINKING (If both types are present)
+        fs_data = master[master['PitchNo'].notnull()] if 'PitchNo' in master.columns else pd.DataFrame()
+        blast_data = master[master['Equipment'].notnull()] if 'Equipment' in master.columns else pd.DataFrame()
+        
+        if not fs_data.empty and not blast_data.empty:
+            st.write("### Linking Blast & Full Swing...")
+            fs_data = fs_data.sort_values('Timestamp')
+            blast_data = blast_data.sort_values('Timestamp')
             
-            # THE FUZZY MERGE (10 second window)
-            # This matches the 'Batter' from FS to the name extracted from Blast row 0
-            linked = pd.merge_asof(
-                fs_master, 
-                blast_master[['Timestamp', 'Player', 'Bat Speed (mph)', 'Rotational Acceleration (g)', 'Attack Angle (deg)']], 
-                on='Timestamp', 
-                by='Player', 
-                direction='nearest', 
-                tolerance=pd.Timedelta('10s')
+            final_df = pd.merge_asof(
+                fs_data, 
+                blast_data[['Timestamp', 'Athlete', 'Bat Speed (mph)', 'Rotational Acceleration (g)', 'Attack Angle (deg)']],
+                on='Timestamp', by='Athlete', direction='nearest', tolerance=pd.Timedelta('10s')
             )
-            
-            # --- THE TRENTON WHEAT ANALYTICS ---
-            st.header("2. Trenton Wheat Dashboard")
-            
-            linked['ExitSpeed'] = pd.to_numeric(linked['ExitSpeed'], errors='coerce')
-            linked['Angle'] = pd.to_numeric(linked['Angle'], errors='coerce')
-            linked['SmashFactor'] = pd.to_numeric(linked['SmashFactor'], errors='coerce')
-            
-            # Identify hardest 12.5% of hits
-            hits = linked[linked['ExitSpeed'] > 0].sort_values('ExitSpeed', ascending=False)
-            num_8th = max(1, int(len(hits) * 0.125))
-            top_8th = hits.head(num_8th)
-            
-            # Create Results Row
-            row = {
-                "Athlete": linked['Player'].iloc[0],
-                "BS Avg": linked['Bat Speed (mph)'].mean(),
-                "BS Max": linked['Bat Speed (mph)'].max(),
-                "BS 1/8th": top_8th['Bat Speed (mph)'].mean(),
-                "RA 1/8th": top_8th['Rotational Acceleration (g)'].mean(),
-                "EV Max": linked['ExitSpeed'].max(),
-                "EV 1/8th": top_8th['ExitSpeed'].mean(),
-                "SF 1/8th": top_8th['SmashFactor'].mean(),
-                "Burners %": (len(top_8th[(top_8th['Angle'] >= -1) & (top_8th['Angle'] <= 9.9)]) / len(top_8th) * 100),
-                "Ropes %": (len(top_8th[(top_8th['Angle'] >= 10) & (top_8th['Angle'] <= 20)]) / len(top_8th) * 100),
-                "Bombs %": (len(top_8th[(top_8th['Angle'] >= 21) & (top_8th['Angle'] <= 31)]) / len(top_8th) * 100),
-            }
-            
-            st.table(pd.DataFrame([row]).style.format(precision=1))
-            st.session_state.master_df = linked
         else:
-            st.error("Need both file types for the same athlete name to link.")
+            final_df = master
+
+        # --- THE TRENTON WHEAT MATH ---
+        st.header(f"📊 {manual_name} - Monthly Report")
+        
+        # Ensure numbers are numbers
+        final_df['ExitSpeed'] = pd.to_numeric(final_df['ExitSpeed'], errors='coerce')
+        final_df['Angle'] = pd.to_numeric(final_df['Angle'], errors='coerce')
+        
+        final_df['Month'] = final_df['Timestamp'].dt.strftime('%b %Y')
+        
+        monthly_table = []
+        for month in final_df['Month'].unique():
+            m_df = final_df[final_df['Month'] == month]
+            
+            # Top 1/8th EV Logic
+            hard_hits = m_df[m_df['ExitSpeed'] > 0].sort_values('ExitSpeed', ascending=False)
+            num_8th = max(1, int(len(hard_hits) * 0.125))
+            top_8th = hard_hits.head(num_8th)
+            
+            # Whiff Calc
+            # Full Swing uses 'BatSpeed', Blast uses 'Bat Speed (mph)'
+            bs_col = 'Bat Speed (mph)' if 'Bat Speed (mph)' in m_df.columns else 'BatSpeed'
+            swings = m_df[m_df[bs_col] > 0]
+            whiffs = swings[(swings['ExitSpeed'].isna()) | (swings['ExitSpeed'] == 0)]
+            whiff_pct = (len(whiffs)/len(swings)*100) if len(swings)>0 else 0
+
+            monthly_table.append({
+                "Month": month,
+                "EV Max": m_df['ExitSpeed'].max(),
+                "EV 1/8th": top_8th['ExitSpeed'].mean() if not top_8th.empty else 0,
+                "BS 1/8th": top_8th[bs_col].mean() if not top_8th.empty else 0,
+                "Burners %": (len(top_8th[(top_8th['Angle'] >= -1) & (top_8th['Angle'] <= 9.9)]) / len(top_8th) * 100) if not top_8th.empty else 0,
+                "Whiff %": f"{whiff_pct:.1f}%",
+                "mph/lbs": m_df['ExitSpeed'].max() / weight if weight > 0 else 0
+            })
+            
+        st.table(pd.DataFrame(monthly_table).style.format(precision=1))
+        
+        # Debugging: Let coach see the raw merged data
+        with st.expander("Show Raw Merged Data"):
+            st.write(final_df)
